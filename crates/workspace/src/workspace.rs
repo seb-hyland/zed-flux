@@ -5504,6 +5504,7 @@ impl Render for Workspace {
             (None, None)
         };
         let ui_font = theme::setup_ui_font(window, cx);
+        let hide_titlebar = WorkspaceSettings::get_global(cx).hide_titlebar;
 
         let theme = cx.theme().clone();
         let colors = theme.colors();
@@ -5521,7 +5522,16 @@ impl Render for Workspace {
                 .items_start()
                 .text_color(colors.text)
                 .overflow_hidden()
-                .children(self.titlebar_item.clone())
+                .when(!hide_titlebar, |this| {
+                    this.children(self.titlebar_item.clone())
+                })
+                .when(hide_titlebar, |this| {
+                    this.child(
+                    h_flex()
+                        .w_full()
+                        .py(Pixels(5.0))
+                        .bg(colors.background))
+                })
                 .child(
                     div()
                         .size_full()
@@ -5539,7 +5549,9 @@ impl Render for Workspace {
                                 .flex()
                                 .flex_col()
                                 .overflow_hidden()
-                                .border_t_1()
+                                .when(!hide_titlebar, |this| {
+                                    this.border_t_1()
+                                })
                                 .border_b_1()
                                 .border_color(colors.border)
                                 .child({

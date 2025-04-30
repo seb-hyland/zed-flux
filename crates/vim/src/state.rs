@@ -49,13 +49,13 @@ pub enum Mode {
 impl Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Mode::Normal => write!(f, "NORMAL"),
-            Mode::Insert => write!(f, "INSERT"),
-            Mode::Replace => write!(f, "REPLACE"),
-            Mode::Visual => write!(f, "VISUAL"),
-            Mode::VisualLine => write!(f, "VISUAL LINE"),
-            Mode::VisualBlock => write!(f, "VISUAL BLOCK"),
-            Mode::HelixNormal => write!(f, "HELIX NORMAL"),
+            Mode::Normal => write!(f, "λ"),
+            Mode::Insert => write!(f, "Σ"),
+            Mode::Replace => write!(f, "?"),
+            Mode::Visual => write!(f, "δ"),
+            Mode::VisualLine => write!(f, "?"),
+            Mode::VisualBlock => write!(f, "?"),
+            Mode::HelixNormal => write!(f, "?"),
         }
     }
 }

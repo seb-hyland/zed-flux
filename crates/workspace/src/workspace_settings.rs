@@ -18,6 +18,8 @@ pub struct WorkspaceSettings {
     pub show_call_status_icon: bool,
     pub autosave: AutosaveSetting,
     pub minimal_welcome: bool,
+    pub hide_titlebar: bool,
+    pub hide_search_button: bool,
     pub restore_on_startup: RestoreOnStartupBehavior,
     pub restore_on_file_reopen: bool,
     pub drop_target_size: f32,
@@ -157,6 +159,14 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: false
     pub minimal_welcome: Option<bool>,
+    /// Whether to hide the titlebar.
+    ///
+    /// Default: false
+    pub hide_titlebar: Option<bool>,
+    /// Whether to hide the project search button in the status bar.
+    ///
+    /// Default: false
+    pub hide_search_button: Option<bool>,
     /// Controls previous session restoration in freshly launched Zed instance.
     /// Values: none, last_workspace, last_session
     /// Default: last_session

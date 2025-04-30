@@ -115,6 +115,10 @@
   "hover_popover_delay": 350,
   // Whether to confirm before quitting Zed.
   "confirm_quit": false,
+  // Whether to hide the titlebar
+  "hide_titlebar": false,
+  // Whether to hide the project search in the status bar
+  "hide_search_button": false,
   // Whether to hide links in the welcome splash
   "minimal_welcome": false,
   // Whether to restore last closed project when fresh Zed instance is opened.

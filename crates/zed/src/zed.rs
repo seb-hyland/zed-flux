@@ -57,7 +57,7 @@ use std::time::Duration;
 use std::{borrow::Cow, path::Path, sync::Arc};
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use theme::{ActiveTheme, ThemeSettings};
-use ui::{PopoverMenuHandle, prelude::*};
+use ui::{PopoverMenuHandle, Tooltip, prelude::*};
 use util::markdown::MarkdownString;
 use util::{ResultExt, asset_str};
 use uuid::Uuid;
@@ -69,7 +69,7 @@ use workspace::{
     WorkspaceSettings, create_and_open_local_file, dock::DockPosition,
     notifications::simple_message_notification::MessageNotification, open_new,
 };
-use workspace::{CloseIntent, RestoreBanner};
+use workspace::{CloseIntent, RestoreBanner, StatusItemView};
 use workspace::{Pane, notifications::DetachAndPromptErr};
 use zed_actions::{
     OpenAccountSettings, OpenBrowser, OpenServerSettings, OpenSettings, OpenZedUrl, Quit,
@@ -160,6 +160,52 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
     }
 }
 
+#[derive(PartialEq)]
+struct BufferName(SharedString, SharedString);
+
+impl Render for BufferName {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .child(
+                Button::new("buffer-name-button", self.1.clone())
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(self.0.clone())),
+            )
+            .border_r_1()
+            .border_color(cx.theme().colors().border.opacity(0.6))
+            .pl_2()
+            .pr_2()
+            .pt(px(2.5))
+    }
+}
+
+impl StatusItemView for BufferName {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new_contents = active_pane_item
+            .and_then(|item| {
+                let raw = item.tab_content_text(0, cx);
+                let trimmed = Path::new(raw.as_ref())
+                    .file_name()
+                    .and_then(|chunk| chunk.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                Some(BufferName(raw.clone(), SharedString::from(trimmed)))
+            })
+            .unwrap_or_else(|| BufferName("".into(), "".into()));
+
+        if new_contents != *self {
+            *self = new_contents;
+            cx.notify();
+        }
+    }
+}
+
 pub fn initialize_workspace(
     app_state: Arc<AppState>,
     prompt_builder: Arc<PromptBuilder>,
@@ -221,6 +267,7 @@ pub fn initialize_workspace(
         });
 
         let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
+        let hide_search_button = WorkspaceSettings::get_global(cx).hide_search_button;
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let activity_indicator = activity_indicator::ActivityIndicator::new(
@@ -237,14 +284,18 @@ pub fn initialize_workspace(
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
+        let buffer_name_item = cx.new(|_| BufferName("".into(), "".into()));
         workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(search_button, window, cx);
+            status_bar.add_left_item(vim_mode_indicator, window, cx);
+            status_bar.add_left_item(buffer_name_item, window, cx);
+            if !hide_search_button {
+                status_bar.add_left_item(search_button, window, cx);
+            }
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_right_item(inline_completion_button, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
-            status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
         });
