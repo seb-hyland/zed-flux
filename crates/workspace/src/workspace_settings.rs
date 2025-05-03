@@ -18,7 +18,7 @@ pub struct WorkspaceSettings {
     pub show_call_status_icon: bool,
     pub autosave: AutosaveSetting,
     pub minimal_welcome: bool,
-    pub hide_titlebar: bool,
+    pub flux_mode: bool,
     pub hide_search_button: bool,
     pub restore_on_startup: RestoreOnStartupBehavior,
     pub restore_on_file_reopen: bool,
@@ -162,7 +162,7 @@ pub struct WorkspaceSettingsContent {
     /// Whether to hide the titlebar.
     ///
     /// Default: false
-    pub hide_titlebar: Option<bool>,
+    pub flux_mode: Option<bool>,
     /// Whether to hide the project search button in the status bar.
     ///
     /// Default: false

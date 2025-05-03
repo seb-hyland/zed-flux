@@ -117,6 +117,7 @@ impl Render for ModeIndicator {
         Label::new(label)
             .size(LabelSize::Default)
             .line_height_style(LineHeightStyle::UiLabel)
+            .mb(px(1.))
             .into_any_element()
     }
 }

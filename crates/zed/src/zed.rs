@@ -167,16 +167,15 @@ impl Render for BufferName {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .child(
-                Button::new("buffer-name-button", self.1.clone())
+                Button::new("buffer-name-button", self.0.clone())
                     .size(ButtonSize::Compact)
                     .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text(self.0.clone())),
+                    .tooltip(Tooltip::text(self.1.clone())),
             )
             .border_r_1()
             .border_color(cx.theme().colors().border.opacity(0.6))
             .pl_2()
             .pr_2()
-            .pt(px(2.5))
     }
 }
 
@@ -189,13 +188,16 @@ impl StatusItemView for BufferName {
     ) {
         let new_contents = active_pane_item
             .and_then(|item| {
-                let raw = item.tab_content_text(0, cx);
-                let trimmed = Path::new(raw.as_ref())
-                    .file_name()
-                    .and_then(|chunk| chunk.to_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                Some(BufferName(raw.clone(), SharedString::from(trimmed)))
+                let short_description = item.tab_content_text(0, cx);
+                let long_description = if let Some(desc) = item.tab_tooltip_text(cx) {
+                    desc
+                } else {
+                    short_description.clone()
+                };
+                Some(BufferName(
+                    short_description.clone(),
+                    long_description.clone(),
+                ))
             })
             .unwrap_or_else(|| BufferName("".into(), "".into()));
 
@@ -267,7 +269,9 @@ pub fn initialize_workspace(
         });
 
         let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
-        let hide_search_button = WorkspaceSettings::get_global(cx).hide_search_button;
+        let settings = WorkspaceSettings::get_global(cx);
+        let hide_search_button = settings.hide_search_button;
+        let flux_mode = settings.flux_mode;
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let activity_indicator = activity_indicator::ActivityIndicator::new(
@@ -287,17 +291,23 @@ pub fn initialize_workspace(
         let buffer_name_item = cx.new(|_| BufferName("".into(), "".into()));
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(vim_mode_indicator, window, cx);
-            status_bar.add_left_item(buffer_name_item, window, cx);
+            if flux_mode {
+                status_bar.add_left_item(buffer_name_item, window, cx);
+            }
             if !hide_search_button {
                 status_bar.add_left_item(search_button, window, cx);
             }
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(inline_completion_button, window, cx);
+            if !flux_mode {
+                status_bar.add_right_item(inline_completion_button, window, cx);
+            }
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
-            status_bar.add_right_item(cursor_position, window, cx);
-            status_bar.add_right_item(image_info, window, cx);
+            if !flux_mode {
+                status_bar.add_right_item(cursor_position, window, cx);
+                status_bar.add_right_item(image_info, window, cx);
+            }
         });
 
         let handle = cx.entity().downgrade();
