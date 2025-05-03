@@ -3,6 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use db::kvp::KEY_VALUE_STORE;
+use serde::{Deserialize, Serialize};
+
 use anyhow::{Result, anyhow};
 use assistant_context_editor::{
     AssistantContext, AssistantPanelDelegate, ConfigurationError, ContextEditor, ContextEvent,
@@ -40,6 +43,7 @@ use zed_actions::agent::OpenConfiguration;
 use zed_actions::assistant::{OpenRulesLibrary, ToggleFocus};
 
 use crate::active_thread::{ActiveThread, ActiveThreadEvent};
+use crate::agent_diff::AgentDiff;
 use crate::assistant_configuration::{AssistantConfiguration, AssistantConfigurationEvent};
 use crate::history_store::{HistoryEntry, HistoryStore, RecentEntry};
 use crate::message_editor::{MessageEditor, MessageEditorEvent};
@@ -48,10 +52,17 @@ use crate::thread_history::{PastContext, PastThread, ThreadHistory};
 use crate::thread_store::ThreadStore;
 use crate::ui::UsageBanner;
 use crate::{
-    AddContextServer, AgentDiff, DeleteRecentlyOpenThread, ExpandMessageEditor, InlineAssistant,
-    NewTextThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ThreadEvent,
-    ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
+    AddContextServer, AgentDiffPane, DeleteRecentlyOpenThread, ExpandMessageEditor,
+    InlineAssistant, NewTextThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff,
+    OpenHistory, ThreadEvent, ToggleContextPicker, ToggleNavigationMenu, ToggleOptionsMenu,
 };
+
+const AGENT_PANEL_KEY: &str = "agent_panel";
+
+#[derive(Serialize, Deserialize)]
+struct SerializedAssistantPanel {
+    width: Option<Pixels>,
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(
@@ -93,7 +104,7 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AssistantPanel>(cx) {
                         workspace.focus_panel::<AssistantPanel>(window, cx);
                         let thread = panel.read(cx).thread.read(cx).thread().clone();
-                        AgentDiff::deploy_in_workspace(thread, workspace, window, cx);
+                        AgentDiffPane::deploy_in_workspace(thread, workspace, window, cx);
                     }
                 })
                 .register_action(|workspace, _: &ExpandMessageEditor, window, cx| {
@@ -302,9 +313,22 @@ pub struct AssistantPanel {
     assistant_navigation_menu: Option<Entity<ContextMenu>>,
     width: Option<Pixels>,
     height: Option<Pixels>,
+    pending_serialization: Option<Task<Result<()>>>,
 }
 
 impl AssistantPanel {
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        let width = self.width;
+        self.pending_serialization = Some(cx.background_spawn(async move {
+            KEY_VALUE_STORE
+                .write_kvp(
+                    AGENT_PANEL_KEY.into(),
+                    serde_json::to_string(&SerializedAssistantPanel { width })?,
+                )
+                .await?;
+            anyhow::Ok(())
+        }));
+    }
     pub fn load(
         workspace: WeakEntity<Workspace>,
         prompt_builder: Arc<PromptBuilder>,
@@ -343,8 +367,19 @@ impl AssistantPanel {
                 })?
                 .await?;
 
-            workspace.update_in(cx, |workspace, window, cx| {
-                cx.new(|cx| {
+            let serialized_panel = if let Some(panel) = cx
+                .background_spawn(async move { KEY_VALUE_STORE.read_kvp(AGENT_PANEL_KEY) })
+                .await
+                .log_err()
+                .flatten()
+            {
+                Some(serde_json::from_str::<SerializedAssistantPanel>(&panel)?)
+            } else {
+                None
+            };
+
+            let panel = workspace.update_in(cx, |workspace, window, cx| {
+                let panel = cx.new(|cx| {
                     Self::new(
                         workspace,
                         thread_store,
@@ -353,8 +388,17 @@ impl AssistantPanel {
                         window,
                         cx,
                     )
-                })
-            })
+                });
+                if let Some(serialized_panel) = serialized_panel {
+                    panel.update(cx, |panel, cx| {
+                        panel.width = serialized_panel.width.map(|w| w.round());
+                        cx.notify();
+                    });
+                }
+                panel
+            })?;
+
+            Ok(panel)
         })
     }
 
@@ -401,11 +445,12 @@ impl AssistantPanel {
                 }
             });
 
+        let thread_id = thread.read(cx).id().clone();
         let history_store = cx.new(|cx| {
             HistoryStore::new(
                 thread_store.clone(),
                 context_store.clone(),
-                [RecentEntry::Thread(thread.clone())],
+                [RecentEntry::Thread(thread_id, thread.clone())],
                 cx,
             )
         });
@@ -423,12 +468,14 @@ impl AssistantPanel {
             ActiveThread::new(
                 thread.clone(),
                 thread_store.clone(),
+                message_editor_context_store.clone(),
                 language_registry.clone(),
                 workspace.clone(),
                 window,
                 cx,
             )
         });
+        AgentDiff::set_active_thread(&workspace, &thread, window, cx);
 
         let active_thread_subscription =
             cx.subscribe(&active_thread, |_, _, event, cx| match &event {
@@ -456,7 +503,8 @@ impl AssistantPanel {
 
                         for entry in recently_opened.iter() {
                             let summary = entry.summary(cx);
-                            menu = menu.entry_with_end_slot(
+
+                            menu = menu.entry_with_end_slot_on_hover(
                                 summary,
                                 None,
                                 {
@@ -467,7 +515,7 @@ impl AssistantPanel {
                                             .update(cx, {
                                                 let entry = entry.clone();
                                                 move |this, cx| match entry {
-                                                    RecentEntry::Thread(thread) => {
+                                                    RecentEntry::Thread(_, thread) => {
                                                         this.open_thread(thread, window, cx)
                                                     }
                                                     RecentEntry::Context(context) => {
@@ -583,6 +631,7 @@ impl AssistantPanel {
             assistant_navigation_menu: None,
             width: None,
             height: None,
+            pending_serialization: None,
         }
     }
 
@@ -625,7 +674,7 @@ impl AssistantPanel {
         let thread_view = ActiveView::thread(thread.clone(), window, cx);
         self.set_active_view(thread_view, window, cx);
 
-        let message_editor_context_store = cx.new(|_cx| {
+        let context_store = cx.new(|_cx| {
             crate::context_store::ContextStore::new(
                 self.project.downgrade(),
                 Some(self.thread_store.downgrade()),
@@ -638,7 +687,7 @@ impl AssistantPanel {
                 .update(cx, |this, cx| this.open_thread(&other_thread_id, cx));
 
             cx.spawn({
-                let context_store = message_editor_context_store.clone();
+                let context_store = context_store.clone();
 
                 async move |_panel, cx| {
                     let other_thread = other_thread_task.await?;
@@ -663,12 +712,14 @@ impl AssistantPanel {
             ActiveThread::new(
                 thread.clone(),
                 self.thread_store.clone(),
+                context_store.clone(),
                 self.language_registry.clone(),
                 self.workspace.clone(),
                 window,
                 cx,
             )
         });
+        AgentDiff::set_active_thread(&self.workspace, &thread, window, cx);
 
         let active_thread_subscription =
             cx.subscribe(&self.thread, |_, _, event, cx| match &event {
@@ -681,7 +732,7 @@ impl AssistantPanel {
             MessageEditor::new(
                 self.fs.clone(),
                 self.workspace.clone(),
-                message_editor_context_store,
+                context_store,
                 self.prompt_store.clone(),
                 self.thread_store.downgrade(),
                 thread,
@@ -842,7 +893,7 @@ impl AssistantPanel {
     ) {
         let thread_view = ActiveView::thread(thread.clone(), window, cx);
         self.set_active_view(thread_view, window, cx);
-        let message_editor_context_store = cx.new(|_cx| {
+        let context_store = cx.new(|_cx| {
             crate::context_store::ContextStore::new(
                 self.project.downgrade(),
                 Some(self.thread_store.downgrade()),
@@ -859,12 +910,14 @@ impl AssistantPanel {
             ActiveThread::new(
                 thread.clone(),
                 self.thread_store.clone(),
+                context_store.clone(),
                 self.language_registry.clone(),
                 self.workspace.clone(),
                 window,
                 cx,
             )
         });
+        AgentDiff::set_active_thread(&self.workspace, &thread, window, cx);
 
         let active_thread_subscription =
             cx.subscribe(&self.thread, |_, _, event, cx| match &event {
@@ -877,7 +930,7 @@ impl AssistantPanel {
             MessageEditor::new(
                 self.fs.clone(),
                 self.workspace.clone(),
-                message_editor_context_store,
+                context_store,
                 self.prompt_store.clone(),
                 self.thread_store.downgrade(),
                 thread,
@@ -940,7 +993,7 @@ impl AssistantPanel {
         let thread = self.thread.read(cx).thread().clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                AgentDiff::deploy_in_workspace(thread, workspace, window, cx)
+                AgentDiffPane::deploy_in_workspace(thread, workspace, window, cx)
             })
             .log_err();
     }
@@ -1099,7 +1152,8 @@ impl AssistantPanel {
             ActiveView::Thread { thread, .. } => self.history_store.update(cx, |store, cx| {
                 if let Some(thread) = thread.upgrade() {
                     if thread.read(cx).is_empty() {
-                        store.remove_recently_opened_entry(&RecentEntry::Thread(thread), cx);
+                        let id = thread.read(cx).id().clone();
+                        store.remove_recently_opened_thread(id, cx);
                     }
                 }
             }),
@@ -1109,7 +1163,8 @@ impl AssistantPanel {
         match &new_view {
             ActiveView::Thread { thread, .. } => self.history_store.update(cx, |store, cx| {
                 if let Some(thread) = thread.upgrade() {
-                    store.push_recently_opened_entry(RecentEntry::Thread(thread), cx);
+                    let id = thread.read(cx).id().clone();
+                    store.push_recently_opened_entry(RecentEntry::Thread(id, thread), cx);
                 }
             }),
             ActiveView::PromptEditor { context_editor, .. } => {
@@ -1202,6 +1257,7 @@ impl Panel for AssistantPanel {
             DockPosition::Left | DockPosition::Right => self.width = size,
             DockPosition::Bottom => self.height = size,
         }
+        self.serialize(cx);
         cx.notify();
     }
 
@@ -1834,7 +1890,7 @@ impl AssistantPanel {
                                     .child(
                                         Banner::new()
                                             .severity(ui::Severity::Warning)
-                                            .children(
+                                            .child(
                                                 Label::new(
                                                     "Configure at least one LLM provider to start using the panel.",
                                                 )
@@ -1867,7 +1923,7 @@ impl AssistantPanel {
                                     .child(
                                         Banner::new()
                                             .severity(ui::Severity::Warning)
-                                            .children(
+                                            .child(
                                                 h_flex()
                                                     .w_full()
                                                     .children(
@@ -1899,6 +1955,41 @@ impl AssistantPanel {
         let usage = self.thread.read(cx).last_usage()?;
 
         Some(UsageBanner::new(plan, usage).into_any_element())
+    }
+
+    fn render_tool_use_limit_reached(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tool_use_limit_reached = self
+            .thread
+            .read(cx)
+            .thread()
+            .read(cx)
+            .tool_use_limit_reached();
+        if !tool_use_limit_reached {
+            return None;
+        }
+
+        let model = self
+            .thread
+            .read(cx)
+            .thread()
+            .read(cx)
+            .configured_model()?
+            .model;
+
+        let max_mode_upsell = if model.supports_max_mode() {
+            " Enable max mode for unlimited tool use."
+        } else {
+            ""
+        };
+
+        Some(
+            Banner::new()
+                .severity(ui::Severity::Info)
+                .child(h_flex().child(Label::new(format!(
+                    "Consecutive tool use limit reached.{max_mode_upsell}"
+                ))))
+                .into_any_element(),
+        )
     }
 
     fn render_last_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2182,6 +2273,7 @@ impl Render for AssistantPanel {
             .map(|parent| match &self.active_view {
                 ActiveView::Thread { .. } => parent
                     .child(self.render_active_thread_or_empty_state(window, cx))
+                    .children(self.render_tool_use_limit_reached(cx))
                     .children(self.render_usage_banner(cx))
                     .child(h_flex().child(self.message_editor.clone()))
                     .children(self.render_last_error(cx)),

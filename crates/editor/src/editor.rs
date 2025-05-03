@@ -871,7 +871,6 @@ pub struct Editor {
     show_breadcrumbs: bool,
     show_gutter: bool,
     show_scrollbars: bool,
-    disable_scrolling: bool,
     disable_expand_excerpt_buttons: bool,
     show_line_numbers: Option<bool>,
     use_relative_line_numbers: Option<bool>,
@@ -982,6 +981,8 @@ pub struct Editor {
     addons: HashMap<TypeId, Box<dyn Addon>>,
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
     load_diff_task: Option<Shared<Task<()>>>,
+    /// Whether we are temporarily displaying a diff other than git's
+    temporary_diff_override: bool,
     selection_mark_mode: bool,
     toggle_fold_multiple_buffers: Task<()>,
     _scroll_cursor_center_top_bottom_task: Task<()>,
@@ -1627,7 +1628,8 @@ impl Editor {
         let mut load_uncommitted_diff = None;
         if let Some(project) = project.clone() {
             load_uncommitted_diff = Some(
-                get_uncommitted_diff_for_buffer(
+                update_uncommitted_diff_for_buffer(
+                    cx.entity(),
                     &project,
                     buffer.read(cx).all_buffers(),
                     buffer.clone(),
@@ -1668,7 +1670,6 @@ impl Editor {
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
             show_scrollbars: true,
-            disable_scrolling: false,
             mode,
             show_breadcrumbs: EditorSettings::get_global(cx).toolbar.breadcrumbs,
             show_gutter: mode.is_full(),
@@ -1804,6 +1805,7 @@ impl Editor {
             serialize_folds: Task::ready(()),
             text_style_refinement: None,
             load_diff_task: load_uncommitted_diff,
+            temporary_diff_override: false,
             mouse_cursor_hidden: false,
             hide_mouse_mode: EditorSettings::get_global(cx)
                 .hide_mouse
@@ -1943,7 +1945,7 @@ impl Editor {
             .is_some_and(|menu| menu.context_menu.focus_handle(cx).is_focused(window))
     }
 
-    fn key_context(&self, window: &Window, cx: &App) -> KeyContext {
+    pub fn key_context(&self, window: &Window, cx: &App) -> KeyContext {
         self.key_context_internal(self.has_active_inline_completion(), window, cx)
     }
 
@@ -5011,11 +5013,11 @@ impl Editor {
                 range
             };
 
-            ranges.push(range);
+            ranges.push(range.clone());
 
             if !self.linked_edit_ranges.is_empty() {
-                let start_anchor = snapshot.anchor_before(selection.head());
-                let end_anchor = snapshot.anchor_after(selection.tail());
+                let start_anchor = snapshot.anchor_before(range.start);
+                let end_anchor = snapshot.anchor_after(range.end);
                 if let Some(ranges) = self
                     .linked_editing_ranges_for(start_anchor.text_anchor..end_anchor.text_anchor, cx)
                 {
@@ -13655,7 +13657,7 @@ impl Editor {
         self.refresh_inline_completion(false, true, window, cx);
     }
 
-    fn go_to_next_hunk(&mut self, _: &GoToHunk, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn go_to_next_hunk(&mut self, _: &GoToHunk, window: &mut Window, cx: &mut Context<Self>) {
         self.hide_mouse_cursor(&HideMouseCursorOrigin::MovementAction);
         let snapshot = self.snapshot(window, cx);
         let selection = self.selections.newest::<Point>(cx);
@@ -16245,9 +16247,9 @@ impl Editor {
         &mut self,
         ids: impl IntoIterator<Item = CreaseId>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Vec<(CreaseId, Range<Anchor>)> {
         self.display_map
-            .update(cx, |map, cx| map.remove_creases(ids, cx));
+            .update(cx, |map, cx| map.remove_creases(ids, cx))
     }
 
     pub fn longest_row(&self, cx: &mut App) -> DisplayRow {
@@ -16488,11 +16490,6 @@ impl Editor {
 
     pub fn set_show_scrollbars(&mut self, show_scrollbars: bool, cx: &mut Context<Self>) {
         self.show_scrollbars = show_scrollbars;
-        cx.notify();
-    }
-
-    pub fn disable_scrolling(&mut self, cx: &mut Context<Self>) {
-        self.disable_scrolling = true;
         cx.notify();
     }
 
@@ -17831,7 +17828,8 @@ impl Editor {
                 let buffer_id = buffer.read(cx).remote_id();
                 if self.buffer.read(cx).diff_for(buffer_id).is_none() {
                     if let Some(project) = &self.project {
-                        get_uncommitted_diff_for_buffer(
+                        update_uncommitted_diff_for_buffer(
+                            cx.entity(),
                             project,
                             [buffer.clone()],
                             self.buffer.clone(),
@@ -17905,6 +17903,32 @@ impl Editor {
             }
             _ => {}
         };
+    }
+
+    pub fn start_temporary_diff_override(&mut self) {
+        self.load_diff_task.take();
+        self.temporary_diff_override = true;
+    }
+
+    pub fn end_temporary_diff_override(&mut self, cx: &mut Context<Self>) {
+        self.temporary_diff_override = false;
+        self.set_render_diff_hunk_controls(Arc::new(render_diff_hunk_controls), cx);
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.set_all_diff_hunks_collapsed(cx);
+        });
+
+        if let Some(project) = self.project.clone() {
+            self.load_diff_task = Some(
+                update_uncommitted_diff_for_buffer(
+                    cx.entity(),
+                    &project,
+                    self.buffer.read(cx).all_buffers(),
+                    self.buffer.clone(),
+                    cx,
+                )
+                .shared(),
+            );
+        }
     }
 
     fn on_display_map_changed(
@@ -18889,7 +18913,8 @@ fn insert_extra_newline_tree_sitter(buffer: &MultiBufferSnapshot, range: Range<u
             .all(|c| c.is_whitespace() && c != '\n')
 }
 
-fn get_uncommitted_diff_for_buffer(
+fn update_uncommitted_diff_for_buffer(
+    editor: Entity<Editor>,
     project: &Entity<Project>,
     buffers: impl IntoIterator<Item = Entity<Buffer>>,
     buffer: Entity<MultiBuffer>,
@@ -18905,6 +18930,13 @@ fn get_uncommitted_diff_for_buffer(
     });
     cx.spawn(async move |cx| {
         let diffs = future::join_all(tasks).await;
+        if editor
+            .read_with(cx, |editor, _cx| editor.temporary_diff_override)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         buffer
             .update(cx, |buffer, cx| {
                 for diff in diffs.into_iter().flatten() {
