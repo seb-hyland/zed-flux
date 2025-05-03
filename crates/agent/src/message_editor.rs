@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::assistant_model_selector::{AssistantModelSelector, ModelType};
-use crate::context::{ContextLoadResult, load_context};
+use crate::context::{AgentContextKey, ContextCreasesAddon, ContextLoadResult, load_context};
 use crate::tool_compatibility::{IncompatibleToolsState, IncompatibleToolsTooltip};
+use crate::ui::{AgentPreview, AnimatedLabel, MaxModeTooltip};
 use buffer_diff::BufferDiff;
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use editor::actions::{MoveUp, Paste};
 use editor::{
-    ContextMenuOptions, ContextMenuPlacement, Editor, EditorElement, EditorEvent, EditorMode,
-    EditorStyle, MultiBuffer,
+    AnchorRangeExt, ContextMenuOptions, ContextMenuPlacement, Editor, EditorElement, EditorEvent,
+    EditorMode, EditorStyle, MultiBuffer,
 };
 use feature_flags::{FeatureFlagAppExt, NewBillingFeatureFlag};
 use file_icons::FileIcons;
@@ -34,17 +35,18 @@ use util::ResultExt as _;
 use workspace::Workspace;
 use zed_llm_client::CompletionMode;
 
-use crate::context_picker::{ContextPicker, ContextPickerCompletionProvider};
+use crate::context_picker::{ContextPicker, ContextPickerCompletionProvider, crease_for_mention};
 use crate::context_store::ContextStore;
 use crate::context_strip::{ContextStrip, ContextStripEvent, SuggestContextKind};
 use crate::profile_selector::ProfileSelector;
-use crate::thread::{Thread, TokenUsageRatio};
+use crate::thread::{MessageCrease, Thread, TokenUsageRatio};
 use crate::thread_store::ThreadStore;
 use crate::{
-    AgentDiff, Chat, ChatMode, ExpandMessageEditor, NewThread, OpenAgentDiff, RemoveAllContext,
-    ToggleContextPicker, ToggleProfileSelector,
+    ActiveThread, AgentDiffPane, Chat, ExpandMessageEditor, NewThread, OpenAgentDiff,
+    RemoveAllContext, ToggleContextPicker, ToggleProfileSelector, register_agent_preview,
 };
 
+#[derive(RegisterComponent)]
 pub struct MessageEditor {
     thread: Entity<Thread>,
     incompatible_tools_state: Entity<IncompatibleToolsState>,
@@ -62,11 +64,63 @@ pub struct MessageEditor {
     edits_expanded: bool,
     editor_is_expanded: bool,
     last_estimated_token_count: Option<usize>,
-    update_token_count_task: Option<Task<anyhow::Result<()>>>,
+    update_token_count_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 const MAX_EDITOR_LINES: usize = 8;
+
+pub(crate) fn create_editor(
+    workspace: WeakEntity<Workspace>,
+    context_store: WeakEntity<ContextStore>,
+    thread_store: WeakEntity<ThreadStore>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    let language = Language::new(
+        language::LanguageConfig {
+            completion_query_characters: HashSet::from_iter(['.', '-', '_', '@']),
+            ..Default::default()
+        },
+        None,
+    );
+
+    let editor = cx.new(|cx| {
+        let buffer = cx.new(|cx| Buffer::local("", cx).with_language(Arc::new(language), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let mut editor = Editor::new(
+            editor::EditorMode::AutoHeight {
+                max_lines: MAX_EDITOR_LINES,
+            },
+            buffer,
+            None,
+            window,
+            cx,
+        );
+        editor.set_placeholder_text("Ask anything, @ to mention, ↑ to select", cx);
+        editor.set_show_indent_guides(false, cx);
+        editor.set_soft_wrap();
+        editor.set_context_menu_options(ContextMenuOptions {
+            min_entries_visible: 12,
+            max_entries_visible: 12,
+            placement: Some(ContextMenuPlacement::Above),
+        });
+        editor.register_addon(ContextCreasesAddon::new());
+        editor
+    });
+
+    let editor_entity = editor.downgrade();
+    editor.update(cx, |editor, _| {
+        editor.set_completion_provider(Some(Box::new(ContextPickerCompletionProvider::new(
+            workspace,
+            context_store,
+            Some(thread_store),
+            editor_entity,
+            None,
+        ))));
+    });
+    editor
+}
 
 impl MessageEditor {
     pub fn new(
@@ -82,46 +136,13 @@ impl MessageEditor {
         let context_picker_menu_handle = PopoverMenuHandle::default();
         let model_selector_menu_handle = PopoverMenuHandle::default();
 
-        let language = Language::new(
-            language::LanguageConfig {
-                completion_query_characters: HashSet::from_iter(['.', '-', '_', '@']),
-                ..Default::default()
-            },
-            None,
+        let editor = create_editor(
+            workspace.clone(),
+            context_store.downgrade(),
+            thread_store.clone(),
+            window,
+            cx,
         );
-
-        let editor = cx.new(|cx| {
-            let buffer = cx.new(|cx| Buffer::local("", cx).with_language(Arc::new(language), cx));
-            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-            let mut editor = Editor::new(
-                editor::EditorMode::AutoHeight {
-                    max_lines: MAX_EDITOR_LINES,
-                },
-                buffer,
-                None,
-                window,
-                cx,
-            );
-            editor.set_placeholder_text("Ask anything, @ to mention, ↑ to select", cx);
-            editor.set_show_indent_guides(false, cx);
-            editor.set_soft_wrap();
-            editor.set_context_menu_options(ContextMenuOptions {
-                min_entries_visible: 12,
-                max_entries_visible: 12,
-                placement: Some(ContextMenuPlacement::Above),
-            });
-            editor
-        });
-
-        let editor_entity = editor.downgrade();
-        editor.update(cx, |editor, _| {
-            editor.set_completion_provider(Some(Box::new(ContextPickerCompletionProvider::new(
-                workspace.clone(),
-                context_store.downgrade(),
-                Some(thread_store.clone()),
-                editor_entity,
-            ))));
-        });
 
         let context_strip = cx.new(|cx| {
             ContextStrip::new(
@@ -147,6 +168,9 @@ impl MessageEditor {
             cx.observe(&context_store, |this, _, cx| {
                 // When context changes, reload it for token counting.
                 let _ = this.reload_context(cx);
+            }),
+            cx.observe(&thread.read(cx).action_log().clone(), |_, _, cx| {
+                cx.notify()
             }),
         ];
 
@@ -186,10 +210,6 @@ impl MessageEditor {
 
     pub fn context_store(&self) -> &Entity<ContextStore> {
         &self.context_store
-    }
-
-    fn toggle_chat_mode(&mut self, _: &ChatMode, _window: &mut Window, cx: &mut Context<Self>) {
-        cx.notify();
     }
 
     pub fn expand_message_editor(
@@ -275,10 +295,11 @@ impl MessageEditor {
             return;
         }
 
-        let user_message = self.editor.update(cx, |editor, cx| {
+        let (user_message, user_message_creases) = self.editor.update(cx, |editor, cx| {
+            let creases = extract_message_creases(editor, cx);
             let text = editor.text(cx);
             editor.clear(window, cx);
-            text
+            (text, creases)
         });
 
         self.last_estimated_token_count.take();
@@ -296,7 +317,13 @@ impl MessageEditor {
 
             thread
                 .update(cx, |thread, cx| {
-                    thread.insert_user_message(user_message, loaded_context, checkpoint.ok(), cx);
+                    thread.insert_user_message(
+                        user_message,
+                        loaded_context,
+                        checkpoint.ok(),
+                        user_message_creases,
+                        cx,
+                    );
                 })
                 .log_err();
 
@@ -374,14 +401,14 @@ impl MessageEditor {
 
         self.context_store.update(cx, |store, cx| {
             for image in images {
-                store.add_image(Arc::new(image), cx);
+                store.add_image_instance(Arc::new(image), cx);
             }
         });
     }
 
     fn handle_review_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.edits_expanded = true;
-        AgentDiff::deploy(self.thread.clone(), self.workspace.clone(), window, cx).log_err();
+        AgentDiffPane::deploy(self.thread.clone(), self.workspace.clone(), window, cx).log_err();
         cx.notify();
     }
 
@@ -391,7 +418,8 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(diff) = AgentDiff::deploy(self.thread.clone(), self.workspace.clone(), window, cx)
+        if let Ok(diff) =
+            AgentDiffPane::deploy(self.thread.clone(), self.workspace.clone(), window, cx)
         {
             let path_key = multi_buffer::PathKey::for_buffer(&buffer, cx);
             diff.update(cx, |diff, cx| diff.move_to_path(path_key, window, cx));
@@ -412,18 +440,19 @@ impl MessageEditor {
         let active_completion_mode = thread.completion_mode();
 
         Some(
-            IconButton::new("max-mode", IconName::SquarePlus)
+            IconButton::new("max-mode", IconName::ZedMaxMode)
                 .icon_size(IconSize::Small)
-                .toggle_state(active_completion_mode == Some(CompletionMode::Max))
+                .icon_color(Color::Muted)
+                .toggle_state(active_completion_mode == CompletionMode::Max)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.thread.update(cx, |thread, _cx| {
                         thread.set_completion_mode(match active_completion_mode {
-                            Some(CompletionMode::Max) => Some(CompletionMode::Normal),
-                            Some(CompletionMode::Normal) | None => Some(CompletionMode::Max),
+                            CompletionMode::Max => CompletionMode::Normal,
+                            CompletionMode::Normal => CompletionMode::Max,
                         });
                     });
                 }))
-                .tooltip(Tooltip::text("Max Mode"))
+                .tooltip(|_, cx| cx.new(MaxModeTooltip::new).into())
                 .into_any_element(),
         )
     }
@@ -481,7 +510,6 @@ impl MessageEditor {
             .on_action(cx.listener(Self::toggle_context_picker))
             .on_action(cx.listener(Self::remove_all_context))
             .on_action(cx.listener(Self::move_up))
-            .on_action(cx.listener(Self::toggle_chat_mode))
             .on_action(cx.listener(Self::expand_message_editor))
             .capture_action(cx.listener(Self::paste))
             .gap_2()
@@ -494,32 +522,34 @@ impl MessageEditor {
                     .items_start()
                     .justify_between()
                     .child(self.context_strip.clone())
-                    .child(
-                        IconButton::new("toggle-height", expand_icon)
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .tooltip({
-                                let focus_handle = focus_handle.clone();
-                                move |window, cx| {
-                                    let expand_label = if is_editor_expanded {
-                                        "Minimize Message Editor".to_string()
-                                    } else {
-                                        "Expand Message Editor".to_string()
-                                    };
+                    .when(focus_handle.is_focused(window), |this| {
+                        this.child(
+                            IconButton::new("toggle-height", expand_icon)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |window, cx| {
+                                        let expand_label = if is_editor_expanded {
+                                            "Minimize Message Editor".to_string()
+                                        } else {
+                                            "Expand Message Editor".to_string()
+                                        };
 
-                                    Tooltip::for_action_in(
-                                        expand_label,
-                                        &ExpandMessageEditor,
-                                        &focus_handle,
-                                        window,
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.dispatch_action(Box::new(ExpandMessageEditor), cx);
-                            })),
-                    ),
+                                        Tooltip::for_action_in(
+                                            expand_label,
+                                            &ExpandMessageEditor,
+                                            &focus_handle,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    window.dispatch_action(Box::new(ExpandMessageEditor), cx);
+                                })),
+                        )
+                    }),
             )
             .child(
                 v_flex()
@@ -721,9 +751,12 @@ impl MessageEditor {
         let border_color = cx.theme().colors().border;
         let active_color = cx.theme().colors().element_selected;
         let bg_edit_files_disclosure = editor_bg_color.blend(active_color.opacity(0.3));
+
         let is_edit_changes_expanded = self.edits_expanded;
+        let is_generating = self.thread.read(cx).is_generating();
 
         v_flex()
+            .mt_1()
             .mx_2()
             .bg(bg_edit_files_disclosure)
             .border_1()
@@ -758,25 +791,44 @@ impl MessageEditor {
                                         cx.notify();
                                     })),
                             )
-                            .child(
-                                Label::new("Edits")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new("•").size(LabelSize::XSmall).color(Color::Muted))
-                            .child(
-                                Label::new(format!(
-                                    "{} {}",
-                                    changed_buffers.len(),
-                                    if changed_buffers.len() == 1 {
-                                        "file"
-                                    } else {
-                                        "files"
-                                    }
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
+                            .map(|this| {
+                                if is_generating {
+                                    this.child(
+                                        AnimatedLabel::new(format!(
+                                            "Editing {} {}",
+                                            changed_buffers.len(),
+                                            if changed_buffers.len() == 1 {
+                                                "file"
+                                            } else {
+                                                "files"
+                                            }
+                                        ))
+                                        .size(LabelSize::Small),
+                                    )
+                                } else {
+                                    this.child(
+                                        Label::new("Edits")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new("•").size(LabelSize::XSmall).color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(format!(
+                                            "{} {}",
+                                            changed_buffers.len(),
+                                            if changed_buffers.len() == 1 {
+                                                "file"
+                                            } else {
+                                                "files"
+                                            }
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                }
+                            }),
                     )
                     .child(
                         Button::new("review", "Review Changes")
@@ -866,7 +918,7 @@ impl MessageEditor {
                                 .justify_between()
                                 .bg(cx.theme().colors().editor_background)
                                 .hover(|style| style.bg(hover_color))
-                                .when(index + 1 < changed_buffers.len(), |parent| {
+                                .when(index < changed_buffers.len() - 1, |parent| {
                                     parent.border_color(border_color).border_b_1()
                                 })
                                 .child(
@@ -882,9 +934,9 @@ impl MessageEditor {
                                                 .gap_0p5()
                                                 .children(name_label)
                                                 .children(parent_label),
-                                        ) // TODO: show lines changed
-                                        .child(Label::new("+").color(Color::Created))
-                                        .child(Label::new("-").color(Color::Deleted)),
+                                        ), // TODO: Implement line diff
+                                           // .child(Label::new("+").color(Color::Created))
+                                           // .child(Label::new("-").color(Color::Deleted)),
                                 )
                                 .child(
                                     div().visible_on_hover("edited-code").child(
@@ -1016,7 +1068,7 @@ impl MessageEditor {
         let load_task = cx.spawn(async move |this, cx| {
             let Ok(load_task) = this.update(cx, |this, cx| {
                 let new_context = this.context_store.read_with(cx, |context_store, cx| {
-                    context_store.new_context_for_thread(this.thread.read(cx))
+                    context_store.new_context_for_thread(this.thread.read(cx), None)
                 });
                 load_context(new_context, &this.project, &this.prompt_store, cx)
             }) else {
@@ -1063,59 +1115,113 @@ impl MessageEditor {
                     .await;
             }
 
-            let token_count = if let Some(task) = this.update(cx, |this, cx| {
-                let loaded_context = this
-                    .last_loaded_context
-                    .as_ref()
-                    .map(|context_load_result| &context_load_result.loaded_context);
-                let message_text = editor.read(cx).text(cx);
+            let token_count = if let Some(task) = this
+                .update(cx, |this, cx| {
+                    let loaded_context = this
+                        .last_loaded_context
+                        .as_ref()
+                        .map(|context_load_result| &context_load_result.loaded_context);
+                    let message_text = editor.read(cx).text(cx);
 
-                if message_text.is_empty()
-                    && loaded_context.map_or(true, |loaded_context| loaded_context.is_empty())
-                {
-                    return None;
-                }
+                    if message_text.is_empty()
+                        && loaded_context.map_or(true, |loaded_context| loaded_context.is_empty())
+                    {
+                        return None;
+                    }
 
-                let mut request_message = LanguageModelRequestMessage {
-                    role: language_model::Role::User,
-                    content: Vec::new(),
-                    cache: false,
-                };
+                    let mut request_message = LanguageModelRequestMessage {
+                        role: language_model::Role::User,
+                        content: Vec::new(),
+                        cache: false,
+                    };
 
-                if let Some(loaded_context) = loaded_context {
-                    loaded_context.add_to_request_message(&mut request_message);
-                }
+                    if let Some(loaded_context) = loaded_context {
+                        loaded_context.add_to_request_message(&mut request_message);
+                    }
 
-                if !message_text.is_empty() {
-                    request_message
-                        .content
-                        .push(MessageContent::Text(message_text));
-                }
+                    if !message_text.is_empty() {
+                        request_message
+                            .content
+                            .push(MessageContent::Text(message_text));
+                    }
 
-                let request = language_model::LanguageModelRequest {
-                    thread_id: None,
-                    prompt_id: None,
-                    mode: None,
-                    messages: vec![request_message],
-                    tools: vec![],
-                    stop: vec![],
-                    temperature: None,
-                };
+                    let request = language_model::LanguageModelRequest {
+                        thread_id: None,
+                        prompt_id: None,
+                        mode: None,
+                        messages: vec![request_message],
+                        tools: vec![],
+                        stop: vec![],
+                        temperature: None,
+                    };
 
-                Some(model.model.count_tokens(request, cx))
-            })? {
-                task.await?
+                    Some(model.model.count_tokens(request, cx))
+                })
+                .ok()
+                .flatten()
+            {
+                task.await.log_err()
             } else {
-                0
+                Some(0)
             };
 
             this.update(cx, |this, cx| {
-                this.last_estimated_token_count = Some(token_count);
-                cx.emit(MessageEditorEvent::EstimatedTokenCount);
+                if let Some(token_count) = token_count {
+                    this.last_estimated_token_count = Some(token_count);
+                    cx.emit(MessageEditorEvent::EstimatedTokenCount);
+                }
                 this.update_token_count_task.take();
             })
+            .ok();
         }));
     }
+}
+
+pub fn extract_message_creases(
+    editor: &mut Editor,
+    cx: &mut Context<'_, Editor>,
+) -> Vec<MessageCrease> {
+    let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+    let mut contexts_by_crease_id = editor
+        .addon_mut::<ContextCreasesAddon>()
+        .map(std::mem::take)
+        .unwrap_or_default()
+        .into_inner()
+        .into_iter()
+        .flat_map(|(key, creases)| {
+            let context = key.0;
+            creases
+                .into_iter()
+                .map(move |(id, _)| (id, context.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    // Filter the addon's list of creases based on what the editor reports,
+    // since the addon might have removed creases in it.
+    let creases = editor.display_map.update(cx, |display_map, cx| {
+        display_map
+            .snapshot(cx)
+            .crease_snapshot
+            .creases()
+            .filter_map(|(id, crease)| {
+                Some((
+                    id,
+                    (
+                        crease.range().to_offset(&buffer_snapshot),
+                        crease.metadata()?.clone(),
+                    ),
+                ))
+            })
+            .map(|(id, (range, metadata))| {
+                let context = contexts_by_crease_id.remove(&id);
+                MessageCrease {
+                    range,
+                    metadata,
+                    context,
+                }
+            })
+            .collect()
+    });
+    creases
 }
 
 impl EventEmitter<MessageEditorEvent> for MessageEditor {}
@@ -1134,8 +1240,11 @@ impl Focusable for MessageEditor {
 impl Render for MessageEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let thread = self.thread.read(cx);
-        let total_token_usage = thread.total_token_usage();
-        let token_usage_ratio = total_token_usage.ratio();
+        let token_usage_ratio = thread
+            .total_token_usage()
+            .map_or(TokenUsageRatio::Normal, |total_token_usage| {
+                total_token_usage.ratio()
+            });
 
         let action_log = self.thread.read(cx).action_log();
         let changed_buffers = action_log.read(cx).changed_buffers(cx);
@@ -1154,3 +1263,90 @@ impl Render for MessageEditor {
             })
     }
 }
+
+pub fn insert_message_creases(
+    editor: &mut Editor,
+    message_creases: &[MessageCrease],
+    context_store: &Entity<ContextStore>,
+    window: &mut Window,
+    cx: &mut Context<'_, Editor>,
+) {
+    let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+    let creases = message_creases
+        .iter()
+        .map(|crease| {
+            let start = buffer_snapshot.anchor_after(crease.range.start);
+            let end = buffer_snapshot.anchor_before(crease.range.end);
+            crease_for_mention(
+                crease.metadata.label.clone(),
+                crease.metadata.icon_path.clone(),
+                start..end,
+                cx.weak_entity(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let ids = editor.insert_creases(creases.clone(), cx);
+    editor.fold_creases(creases, false, window, cx);
+    if let Some(addon) = editor.addon_mut::<ContextCreasesAddon>() {
+        for (crease, id) in message_creases.iter().zip(ids) {
+            if let Some(context) = crease.context.as_ref() {
+                let key = AgentContextKey(context.clone());
+                addon.add_creases(
+                    context_store,
+                    key,
+                    vec![(id, crease.metadata.label.clone())],
+                    cx,
+                );
+            }
+        }
+    }
+}
+impl Component for MessageEditor {
+    fn scope() -> ComponentScope {
+        ComponentScope::Agent
+    }
+}
+
+impl AgentPreview for MessageEditor {
+    fn agent_preview(
+        workspace: WeakEntity<Workspace>,
+        active_thread: Entity<ActiveThread>,
+        thread_store: WeakEntity<ThreadStore>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if let Some(workspace_entity) = workspace.upgrade() {
+            let fs = workspace_entity.read(cx).app_state().fs.clone();
+            let weak_project = workspace_entity.read(cx).project().clone().downgrade();
+            let context_store = cx.new(|_cx| ContextStore::new(weak_project, None));
+            let thread = active_thread.read(cx).thread().clone();
+
+            let example_message_editor = cx.new(|cx| {
+                MessageEditor::new(
+                    fs,
+                    workspace,
+                    context_store,
+                    None,
+                    thread_store,
+                    thread,
+                    window,
+                    cx,
+                )
+            });
+
+            Some(
+                v_flex()
+                    .gap_4()
+                    .children(vec![single_example(
+                        "Default",
+                        example_message_editor.clone().into_any_element(),
+                    )])
+                    .into_any_element(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+register_agent_preview!(MessageEditor);
