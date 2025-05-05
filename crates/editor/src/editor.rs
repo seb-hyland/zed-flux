@@ -230,7 +230,6 @@ pub(crate) const SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT: Duration = Duration:
 
 pub(crate) const EDIT_PREDICTION_KEY_CONTEXT: &str = "edit_prediction";
 pub(crate) const EDIT_PREDICTION_CONFLICT_KEY_CONTEXT: &str = "edit_prediction_conflict";
-pub(crate) const MIN_LINE_NUMBER_DIGITS: u32 = 4;
 
 pub type RenderDiffHunkControlsFn = Arc<
     dyn Fn(
@@ -20091,9 +20090,10 @@ impl EditorSnapshot {
         let show_line_numbers = self
             .show_line_numbers
             .unwrap_or(gutter_settings.line_numbers);
+        let line_number_min_digits = EditorSettings::get_global(cx).gutter.line_number_min_digits;
         let line_gutter_width = if show_line_numbers {
             // Avoid flicker-like gutter resizes when the line number gains another digit and only resize the gutter on files with N*10^5 lines.
-            let min_width_for_number_on_gutter = em_advance * MIN_LINE_NUMBER_DIGITS as f32;
+            let min_width_for_number_on_gutter = em_advance * line_number_min_digits as f32;
             max_line_number_width.max(min_width_for_number_on_gutter)
         } else {
             0.0.into()

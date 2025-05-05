@@ -123,6 +123,7 @@ pub struct Gutter {
     pub runnables: bool,
     pub breakpoints: bool,
     pub folds: bool,
+    pub line_number_min_digits: u32,
 }
 
 /// When to show the scrollbar in the editor.
@@ -484,6 +485,10 @@ pub struct GutterContent {
     ///
     /// Default: true
     pub folds: Option<bool>,
+    /// Minimum width of line numbering, in digits.
+    ///
+    /// Default: 4
+    pub line_number_min_digits: Option<u32>,
 }
 
 impl EditorSettings {

@@ -1,4 +1,4 @@
-.PHONY = build_zed build_cli build desktop install uninstall clean
+.PHONY = build desktop install uninstall clean
 
 all: build install
 
@@ -16,16 +16,12 @@ define WARNING
 endef
 
 
-build_zed:
-	@$(call INFO,Building Zed editor...)
-	@cargo build --release --package zed
-
-build_cli:
-	@$(call INFO,Building Zed CLI...)
-	@cargo build --release --package cli
-
-build: build_zed build_cli
-
+build:
+	@$(call INFO,Building Zed binaries...)
+	@export ZED_UPDATE_EXPLANATION='Updates are built manually'; \
+	CFLAGS+=' -flto=thin'; \
+    CXXFLAGS+=' -flto=thin'; \
+    cargo build --release -p cli -p zed
 
 desktop:
 	@$(call INFO,Creating .desktop file...)
@@ -40,11 +36,11 @@ desktop:
 
 install: desktop
 	@$(call INFO,Installing components...)
-	@sudo mkdir -p "usr/lib/zed/"
+	@sudo mkdir -p "/usr/lib/zed/"
 	@sudo cp target/release/zed /usr/lib/zed/$(LIBNAME)
 	@sudo cp target/release/cli /usr/bin/$(PKGNAME)
 	@sudo cp target/release/$(APP_ID).desktop /usr/share/applications/$(APP_ID).desktop
-	@sudo cp crates/zed/resources/app-icon.png /usr/share/icons/$(PKGNAME).png
+	@sudo cp crates/zed/resources/app-icon-nightly.png /usr/share/icons/$(PKGNAME).png
 	@$(call INFO,Zed has been successfully installed!)
 
 

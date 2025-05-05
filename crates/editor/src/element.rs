@@ -6,7 +6,7 @@ use crate::{
     EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle,
     FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput,
     HoveredCursor, InlayHintRefreshReason, InlineCompletion, JumpData, LineDown, LineHighlight,
-    LineUp, MAX_LINE_LEN, MIN_LINE_NUMBER_DIGITS, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts,
+    LineUp, MAX_LINE_LEN, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts,
     PageDown, PageUp, PhantomBreakpointIndicator, Point, RowExt, RowRangeExt, SelectPhase,
     SelectedTextHighlight, Selection, SoftWrap, StickyHeaderExcerpt, ToPoint, ToggleFold,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
@@ -2368,7 +2368,8 @@ impl EditorElement {
                 let available_width = gutter_dimensions.left_padding - git_gutter_width;
 
                 let editor = self.editor.clone();
-                let is_wide = max_line_number_length >= MIN_LINE_NUMBER_DIGITS
+                let line_number_min_digits = EditorSettings::get_global(cx).gutter.line_number_min_digits;
+                let is_wide = max_line_number_length >= line_number_min_digits
                     && row_info
                         .buffer_row
                         .is_some_and(|row| (row + 1).ilog10() + 1 == max_line_number_length)
