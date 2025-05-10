@@ -6,7 +6,7 @@ use crate::{
     EditDisplayMode, Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle,
     FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput,
     HoveredCursor, InlayHintRefreshReason, InlineCompletion, JumpData, LineDown, LineHighlight,
-    LineUp, MAX_LINE_LEN, MIN_LINE_NUMBER_DIGITS, MINIMAP_FONT_SIZE,
+    LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE,
     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, PageDown, PageUp, PhantomBreakpointIndicator,
     Point, RowExt, RowRangeExt, SelectPhase, SelectedTextHighlight, Selection, SoftWrap,
     StickyHeaderExcerpt, ToPoint, ToggleFold,
